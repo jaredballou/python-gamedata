@@ -6,14 +6,16 @@ format needed for inclusion in insurgency-data mods format. It supports version
 separation, extracting files from VPK or filesystem, and is managed via the
 config.yaml file.
 """
-import vpk
-import os
-import sys
-import yaml
 import configparser
-from glob import glob
 from fnmatch import fnmatch
+from glob import glob
+import os
 from shutil import copyfile
+import subprocess
+import sys
+import vpk
+import vdf
+import yaml
 
 class GameData(object):
 	"""Main GameData object to wrap all other types. This will eventually be a singleton, for now only create one object.
@@ -105,6 +107,7 @@ class Game(object):
 		self.game_name = game_name
 		self.vpks = {}
 		self.maps = {}
+		self.mterials = {}
 		if extract_paths is None:
 			extract_paths = self.parent.config['extract_paths']
 		self.extract_paths = extract_paths
@@ -117,7 +120,7 @@ class Game(object):
 				return
 
 		self.steam_inf = self.load_steam_inf()
-
+		self.load_metadata(os.path.join(extract_root,"metadata.yaml"))
 		self.extract_root = os.path.join(extract_root,self.steam_inf['patchversion'])
 
 		if self.parent.config['do_vpks']:
@@ -125,7 +128,36 @@ class Game(object):
 			self.load_vpks()
 			self.extract_vpk_files(force=False)
 		if self.parent.config['do_maps']:
-			self.find_maps()
+			#self.find_maps()
+			self.load_maps()
+		if self.parent.config['do_materials']:
+			self.find_materials()
+
+	def load_metadata(self, metadata_file):
+		if os.path.isfile(metadata_file):
+			with open(metadata_file, 'r') as ymlfile:
+				self.metadata = yaml.load(ymlfile)
+				self.metadata_file = metadata_file
+		else:
+			print("ERROR: Cannot find '%s'!" % metadata_file)
+
+	def find_file(self, file, recurse=False, default=""):
+		"""Find a file in game directory or data directory.
+			Returns: Full path to file if found, default if not.
+		"""
+		# TODO: Support recursion to find file in deeper paths
+		for test_path in [self.extract_root, self.game_root]:
+			test_file = os.path.join(test_path, file)
+			if os.path.exists(test_file):
+				return test_file
+		return default
+
+	def load_maps(self):
+		"""Load maps listed in metadata file"""
+		if not "maps" in self.metadata or not self.metadata["maps"]:
+			return
+		for map in self.metadata['maps']:
+			self.maps[map] = Map(name=map, parent=self)
 
 	def find_maps(self):
 		"""Locate all Map related files"""
@@ -141,30 +173,26 @@ class Game(object):
 			Args:
 		"""
 		for root, dirs, files in os.walk(map_path):
+			map_names = sorted(list(set([os.path.splitext(file)[0].strip(".") for file in files if os.path.splitext(file)[1].strip(".") in ["bsp", "nav", "txt"]])))
+			for map in map_names:
+				self.maps[map] = Map(name=map, parent=self)
+
+	def find_materials(self, export_format="png"):
+		"""Locate all Material related files"""
+		for root, dirs, files in os.walk(os.path.join(self.extract_root, "materials")):
 			for file in files:
 				ext = os.path.splitext(file)[1].strip(".")
-				if not ext in ["bsp", "nav", "txt"]:
+				if not ext in ["vmt", "vtf", export_format]:
 					continue
-				file_path = os.path.join(root,file)
-				data_file = file_path.replace(self.game_root,"").strip("/\\")
-				data_path = os.path.join(self.extract_root,data_file)
-				if ext == "bsp":
-					# TODO: Decompile map with BSPSRC
-					#java -jar 
+				if ext == "vmt":
+					# TODO: Parse VMT as KeyValues
 					pass
-				elif ext == "nav":
-					# TODO: Process navmesh
+				elif ext == "vtf":
+					# TODO: Export VTF to PNG
 					pass
-				elif ext == "txt":
-					if os.path.exists(data_path) and not force:
-						return
-					data_dir = os.path.dirname(data_path)
-					if not os.path.exists(data_dir):
-						print "Creating %s" % data_dir
-						os.makedirs(data_dir)
-					# TODO: Compare file contents and force together
-					print "Copying %s to %s" % (data_file, data_path)
-					#copyfile(file_path,data_path)
+				elif ext == export_format:
+					# TODO: Verify exported image matches source file
+					pass
 
 	def find_game_root(self):
 		"""Locate the root install directory of this game"""
@@ -225,11 +253,81 @@ class Map(object):
 			 (): 
 			 (): 
 	"""
-	def __init__(self):
+	def __init__(self, parent, name, bsp=None, nav=None, cpsetup_txt=None, overview_txt=None, overview_vtf=None, parsed_file=None, vmf_file=None, do_parse=True, decompile=True, unpack_files=True):
 		"""
 			Args:
 		"""
+		self.parent = parent
+		self.name = name
+		self.files = {}
+		self.map_files = {}
+		self.do_parse = do_parse
+		self.decompile = decompile
+		self.unpack_files = unpack_files
+		self.find_map_files()
+		if do_parse:
+			self.parse_map_files()
+
+	def find_map_files(self):
+		for file_type,file_path in self.parent.parent.config['map_files'].iteritems():
+			self.map_files[file_type] = os.path.join(self.parent.extract_root,file_path % vars(self))
+			map_file = self.parent.find_file(file=file_path % vars(self))
+			if map_file:
+				self.files[file_type] = map_file
+
+	def parse_map_files(self):
+		for type,file in self.files.iteritems():
+			if type == "bsp" and self.decompile:
+				self.parse_bsp()
+			if type == "nav":
+				self.parse_nav()
+			if type == "cpsetup_txt":
+				self.parse_cpsetup_txt()
+			if type == "overview_txt":
+				self.parse_overview_txt()
+
+	def parse_bsp(self, force=False):
+		"""Decompile BSP file to VMF"""
+		if os.path.exists(self.map_files["vmf"]) and not force:
+			return
+		try:
+			print("Decompiling %s..." % self.name)
+			vmf_dir = os.path.dirname(self.map_files["vmf"])
+			if not os.path.exists(vmf_dir):
+				os.makedirs(vmf_dir)
+			bspsrc_args = ['-no_areaportals', '-no_cubemaps', '-no_details', '-no_occluders', '-no_overlays', '-no_rotfix', '-no_sprp', '-no_brushes', '-no_cams', '-no_lumpfiles', '-no_prot', '-no_visgroups']
+			bspsrc_cmd = ['java', '-cp', self.parent.parent.config['tools']['bspsrc'], 'info.ata4.bspsrc.cli.BspSourceCli'] + bspsrc_args + [self.files["bsp"], '-o', self.map_files["vmf"]]
+			process = subprocess.Popen(bspsrc_cmd, stdout=subprocess.PIPE)
+			out, err = process.communicate()
+			print("Done")
+		except:
+			print("Failed")
 		pass
+
+	def parse_nav(self):
+		"""Parse NAV file and export JSON object with relevant data"""
+		pass
+
+	def parse_cpsetup_txt(self):
+		"""Process cpsetup.txt file"""
+		try:
+			data = vdf.load(open(self.files["cpsetup_txt"]))
+			#print(data)
+		except:
+			print(self.files["cpsetup_txt"])
+
+	def parse_overview_txt(self):
+		"""Process Overview text file"""
+		try:
+			data = vdf.load(open(self.files["overview_txt"]))
+			#print(data)
+		except:
+			print(self.files["overview_txt"])
+
+	def export_parsed(self):
+		"""Export all parsed data to single JSON file for all map objects."""
+		pass
+
 """
 		BASENAME=$(basename "${MAP}" .bsp)
 		SRCFILE="${DATADIR}/maps/src/${BASENAME}_d.vmf"
@@ -239,7 +337,7 @@ class Map(object):
 			add_manifest_md5 "${SRCFILE}"
 		fi
 		# Check if the map even needs to be unzipped/extracted
-BSPSRC="java -cp ${REPODIR}/thirdparty/bspsrc/bspsrc.jar info.ata4.bspsrc.cli.BspSourceCli -no_areaportals -no_cubemaps -no_details -no_occluders -no_overlays -no_rotfix -no_sprp -no_brushes -no_cams -no_lumpfiles -no_prot -no_visgroups"
+BSPSRC="java -cp ${REPODIR}/thirdparty/bspsrc/bspsrc.jar
 # Pakrat command
 PAKRAT="java -jar ${REPODIR}/thirdparty/pakrat/pakrat.jar"
 			$BSPSRC "${MAP}" -o "${SRCFILE}"
@@ -263,6 +361,29 @@ PAKRAT="java -jar ${REPODIR}/thirdparty/pakrat/pakrat.jar"
 			unzip -o "${ZIPFILE}" -d "${DATADIR}/" $MAPSRCLIST 2>/dev/null
 		fi
 """
+
+class Material(object):
+	"""This class manages VMT/VTF materials. It creates PNG files
+	for the Web UI."""
+
+	def __init__(self, parent):
+		""" """
+		self.parent = parent
+
+	def export_png(self, material, png):
+		""" """
+		#subprocess.call(['java', '-jar', self.parent.config['tools']['vtf2tga'])
+		pass
+
+	def parse_vmt(self):
+		"""Process a VMT file as KeyValues"""
+		pass
+
+	def parse_vtf(self):
+		"""Process a VTF file into an image object"""
+		pass
+
+
 class VPKFile(object):
 	"""VPK File. Supports loading, getting list of files, and extracting files.
 		Attributes:
@@ -274,7 +395,7 @@ class VPKFile(object):
 			 (): 
 			 (): 
 	"""
-	def __init__(self,vpk_file,parent):
+	def __init__(self, vpk_file, parent):
 		"""
 			Args:
 		"""
